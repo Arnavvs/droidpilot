@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "droidpilot": {
+      "command": "python",
+      "args": ["bridge/mcp_bridge.py"],
+      "env": {
+        "DROIDPILOT_URL": "http://127.0.0.1:8765"
+      }
+    }
+  }
+}

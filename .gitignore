@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Runtime output: screenshots, recordings, scraped feeds, traces.
+artifacts/
+*.mp4
+*.png
+
+# Secrets and per-machine state.
+.env
+.droidpilot/
+token
+*.session
+cookie.json
+
+# Android bridge build output and its signing key. The keystore is generated
+# locally on first build - committing it would ship a private key.
+android/build/
+android/debug.keystore
+*.keystore
+*.apk

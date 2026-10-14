@@ -1,0 +1,58 @@
+{
+  "_about": [
+    "Links open_link will follow. A link replaces a whole navigation sequence - fewer steps, fewer tokens.",
+    "prefix: the URL must start with this. package: the app it must land in; landing anywhere else is an error, not a success.",
+    "count / platform (optional): the read this link performs, passed to the policy/reads.py hooks. sample: a harmless value used to verify it.",
+    "verified: null until `droidpilot deeplinks --verify` opened it on a real phone and saw the package come to the front. open_link refuses unverified links."
+  ],
+  "links": [
+    {
+      "prefix": "instagram://user?username=",
+      "package": "com.instagram.android",
+      "note": "opens a profile directly; replaces search + typing + tapping a result",
+      "sample": "instagram",
+      "verified": {
+        "date": "2026-09-18",
+        "device": "SM-M215F",
+        "android": "12",
+        "app_version": "447.0.0.55.81"
+      }
+    },
+    {
+      "prefix": "https://t.me/",
+      "package": "org.telegram.messenger",
+      "note": "opens a public channel or group by handle, joined or not",
+      "sample": "telegram",
+      "verified": {
+        "date": "2026-09-18",
+        "device": "RMX3395",
+        "android": "14",
+        "app_version": "12.10.1"
+      }
+    },
+    {
+      "prefix": "tg://resolve?domain=",
+      "package": "org.telegram.messenger",
+      "note": "the app-native form of a t.me handle link; public usernames only",
+      "sample": "telegram",
+      "verified": {
+        "date": "2026-09-18",
+        "device": "RMX3395",
+        "android": "14",
+        "app_version": "12.10.1"
+      }
+    },
+    {
+      "prefix": "twitter://user?screen_name=",
+      "package": "com.twitter.android",
+      "note": "opens an X profile directly",
+      "sample": "X",
+      "verified": {
+        "date": "2026-09-18",
+        "device": "SM-M215F",
+        "android": "12",
+        "app_version": "12.25.2-prod.01"
+      }
+    }
+  ]
+}

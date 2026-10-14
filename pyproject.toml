@@ -1,0 +1,32 @@
+[project]
+name = "droidpilot"
+version = "0.1.0"
+description = "An agent that runs on your Android phone and drives it - Claude Code for a handset"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Arnav Vashishtha" }]
+keywords = ["android", "agent", "llm", "automation", "adb", "termux", "uiautomator"]
+dependencies = ["uiautomator2>=3.7.0"]
+
+[project.optional-dependencies]
+mcp = ["mcp[cli]>=2.1.1"]
+
+[project.scripts]
+droidpilot = "droidpilot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Arnavvs/droidpilot"
+Issues = "https://github.com/Arnavvs/droidpilot/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"droidpilot.selectors" = ["*.json"]
+"droidpilot.policy" = ["*.json"]
+"droidpilot.cards" = ["*.md", "*.json"]

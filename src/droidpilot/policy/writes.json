@@ -1,0 +1,25 @@
+{
+  "_about": [
+    "Controls that change state, matched on the element a tap will actually hit.",
+    "A rule matches when its `rid` regex full-matches the element's resource-id or anchor",
+    "(if given) AND its `label` regex is found in the lowercased text or content-desc (if given).",
+    "`action` = a write the operator can enable for a run (--allow-write <action>).",
+    "`forbidden` = refused unless the operator allows that rule id for the run (--allow-rule <id>).",
+    "App rules (under `apps`, keyed by package) are checked before `any_app` rules. First match wins.",
+    "`counted` (per app) = taps that open a read the policy/reads.py hooks should count.",
+    "`composers` = boxes where typing is a send (comment, message, reply); text entry there is refused."
+  ],
+  "apps": {},
+  "any_app": [
+    {"id": "any.send", "label": "^(send|send message|post|publish|share now)$",
+     "forbidden": "send or publish something"},
+    {"id": "any.money", "label": "^(pay|pay now|buy now|place order|subscribe|donate|send gift)$",
+     "forbidden": "spend money"},
+    {"id": "any.account", "label": "^(report|block|unfollow|delete account|log out|sign out)$",
+     "forbidden": "an account-level action"}
+  ],
+  "composers": {
+    "rids": {},
+    "hint": "^(add a comment( for .+)?(…|\\.\\.\\.)?|what do you think of this\\??|message(…|\\.\\.\\.)?|reply to .*|post your reply|write a (comment|message).*|add a caption.*)$"
+  }
+}

@@ -1,0 +1,791 @@
+# Architecture
+
+How DroidPilot works, and why it is built this way. Where a decision was made
+against an obvious alternative, the measurement that decided it is included.
+
+- [The problem](#the-problem)
+- [The privilege trick](#the-privilege-trick)
+- [Layers](#layers)
+- [Packs](#packs)
+- [The agent loop](#the-agent-loop)
+- [Two tool-calling conventions](#two-tool-calling-conventions)
+- [Delegate vs proxy](#delegate-vs-proxy)
+- [Permissions](#permissions)
+- [Selectors and drift](#selectors-and-drift)
+- [What this is not](#what-this-is-not)
+
+---
+
+## The problem
+
+An agent that drives a phone from a laptop has a structural weakness: the model
+doing the reasoning is not where the work happens. Every `tap` is a network
+round trip, every screen read ships kilobytes back across a link, and the whole
+arrangement stops the moment the laptop sleeps or the Wi-Fi drops.
+
+The obvious fix is to move the agent onto the phone. The obvious justification
+for that fix — "local tool calls will be faster" — turns out to be **wrong**,
+and it is worth being precise about why, because the real justification is
+different and leads to a different design.
+
+Measured on the target device (full table in [BENCHMARKS.md](BENCHMARKS.md)):
+
+| Path | Median per screen read |
+|---|---|
+| `uiautomator dump` CLI, over Wi-Fi | 2540 ms |
+| `uiautomator dump` CLI, on-device via loopback | 2520 ms |
+| **uiautomator2 persistent server, over Wi-Fi** | **220 ms** |
+| **uiautomator2 persistent server, on-device** | **306 ms** |
+| **accessibility bridge, on-device** (phase 2) | **13 ms** |
+
+Two things fall out of this:
+
+1. **The transport was never the bottleneck.** Moving on-device saved 20 ms out
+   of 2540. What saved 2300 ms was abandoning the `uiautomator dump` CLI — which
+   spawns a fresh instrumentation process per call — for a persistent server.
+   The remaining 220 ms turned out to be a property of *uiautomator2*, not of
+   Android: the accessibility bridge reads the same screen in **13 ms**,
+   because it walks a tree it already holds in process.
+2. **On-device is measurably *slower* per call** (306 ms vs 220 ms). The phone's
+   A78 cores serialise the view hierarchy more slowly than the laptop consumes
+   it over Wi-Fi.
+
+So on-device execution is not a latency optimisation. It is justified by three
+other things, and the design leans on those instead:
+
+- **Autonomy.** The phone runs untethered. Nothing breaks when the laptop
+  sleeps, the Wi-Fi flaps, or you walk out of the house.
+- **Where the expensive turn happens.** With the laptop as the brain, *every*
+  step costs a turn of a large frontier model carrying a large context. With
+  the phone as the brain, each step costs a turn of a cheap model, and the
+  laptop spends exactly one delegation. That is the actual saving, and it is
+  large — see [Delegate vs proxy](#delegate-vs-proxy).
+- **Compound tools.** `collect_feed` scrolls a timeline thirty times and returns
+  one deduplicated list. On-device, those thirty screen reads never touch the
+  network at all.
+
+---
+
+## The privilege trick
+
+Everything rests on one fact about Android that is easy to miss.
+
+Termux runs as an ordinary app uid (`u0_a308` here). That uid is **denied** the
+commands an automation agent actually needs:
+
+```
+$ input tap 1 1                          # from Termux directly
+  DENIED
+$ settings get system screen_brightness
+  DENIED
+```
+
+The Android *shell* uid (2000) is allowed all of them. Normally you reach uid
+2000 from a computer over USB. But `adbd` listening on TCP does not care where
+the client is — including a client on the same device:
+
+```
+$ adb connect 127.0.0.1:5555     # run from inside Termux
+$ adb -s 127.0.0.1:5555 shell id
+uid=2000(shell) gid=2000(shell) groups=2000(shell),1004(input),1007(log),...
+```
+
+**The phone drives itself at shell privilege, unrooted, with no Shizuku.** One
+Android dialog authorises the Termux-generated adb key, once, and
+`/data/misc/adb/adb_keys` remembers it.
+
+The consequence for the code is that there is only one code path.
+`device.shell()` shells out to `adb -s <serial>`; the serial is a LAN address
+from a laptop and `127.0.0.1:5555` on the phone. Nothing above that layer knows
+or cares which.
+
+```
+┌── laptop ───────────┐          ┌── phone ─────────────────────────────┐
+│ droidpilot         │          │  Termux (uid 10308)                  │
+│   device.shell() ───┼── Wi-Fi ─┼─▶ adbd ──▶ uid 2000 ──▶ input/uiauto │
+└─────────────────────┘          │     ▲                                │
+                                 │     │ 127.0.0.1:5555                 │
+                                 │  droidpilot (same code)             │
+                                 └──────────────────────────────────────┘
+```
+
+**Caveat.** Wireless adb generally stops listening after a reboot, which takes
+the loopback with it. `droidpilot doctor` reports this precisely, and
+[SETUP-PHONE.md](SETUP-PHONE.md#surviving-a-reboot) covers the options.
+
+---
+
+## Layers
+
+```
+  cli.py            run · serve · tools · tool · doctor · mcp
+  ────────────────────────────────────────────────────────────
+  server.py         POST /task  (delegate)   POST /tool (proxy)
+  bridge/           laptop-side MCP: phone_task, phone_tool
+  ────────────────────────────────────────────────────────────
+  harness/loop.py   see → act → see, budgets, compaction
+  harness/models.py OpenRouter | local llama.cpp  (one wire format)
+  harness/registry  102 tools in 6 packs, JSON schemas
+  ────────────────────────────────────────────────────────────
+  tools/            device · ui · input · system · shell · files
+                    phone · learn
+  ────────────────────────────────────────────────────────────
+  runtime/          observation cache, diffs, event-driven change detection
+  runtime/bridge    the 13 ms AccessibilityService backend (phase 2)
+  ui.py             XML hierarchy → compact typed elements
+  selectors/        versioned per-app field maps + drift detection
+  device.py         adb + uiautomator2, serial-agnostic
+```
+
+The bottom three layers are inherited from
+[MobileAgentMCP](https://github.com/Arnavvs/MobileAgentMCP) and were ported
+unchanged. That was possible because `ToolRegistry` deliberately exposes the
+same `.tool(description=...)` decorator an MCP server does, so every existing
+tool module registered against the new harness without being rewritten.
+
+### Screens as data, not pixels
+
+A raw uiautomator hierarchy for one Instagram reel is ~70 KB of XML.
+`ui.parse()` flattens it to typed elements, typically 1–3 KB:
+
+```jsonc
+{
+  "package": "com.instagram.android",
+  "screen": "reels_viewer",
+  "dump_ms": 224,
+  "elements": [
+    {"i": 12, "id": "clips_author_username", "text": "creator_a", "c": [402,1964], "f": "C"},
+    {"i": 18, "id": "like_count", "text": "The like number is 9732.", "c": [990,1041], "f": "C"}
+  ]
+}
+```
+
+`i` is the element index; every read also returns `ver`, and taps take `ref="<ver>_<i>"`. Before tapping, the element is found again on a fresh read (`runtime/targeting.py`): if it moved the tap follows it, and if it is gone, replaced, hidden or covered by another window the tap is refused with the reason. A ref from an older screen version is refused outright. `c` is the tap centre. `f` flags
+`C`lickable / `S`crollable / selected. `screenshot` exists but returns a **file
+path**, never inline image data, so it cannot silently flood a context window.
+
+One hard-won detail encoded here: **values often sit on anonymous child nodes**,
+not on the resource-id that names them. Instagram's caption lives under
+`clips_caption_component`; `media_album_art_button` merely carries the literal
+string `"Audio"`. Every element therefore reports its `anchor` — the nearest
+ancestor id — so a value can be found by the container that owns it.
+
+---
+
+## Packs
+
+Every tool's JSON schema is sent on every turn. Measured on this build
+(characters / 4):
+
+| Exposed | Tools | Tokens per turn |
+|---|---|---|
+| `core` only | 37 | ~4,000 |
+| everything | 102 | ~9,500 |
+
+That is **2.4× the schema overhead on every single turn**, before the task is
+even described — and cheap models also get measurably worse at picking the right
+tool as the list grows. The gap widens with every app pack you add; the private
+build this was extracted from carries 188 tools in 12 packs (~4,200 vs ~16,500
+tokens).
+
+So tools are grouped into packs and only `core` is loaded. The model widens its
+own surface:
+
+```
+list_tool_packs()          → what exists, what is loaded
+find_tool("send a text")   → searches unloaded packs too
+use_tools("phone")         → loads it for the rest of the run
+drop_tools("phone")        → hands the context back
+```
+
+`core` is chosen to be exactly enough to orient on an unknown screen and find
+everything else: device info, `ui_dump`, `find_element`, the four input verbs,
+and the four meta-tools.
+
+---
+
+## The agent loop
+
+`harness/loop.py`. A generator, not a function — it yields events as they
+happen, which is what makes both the live CLI output and the NDJSON stream
+possible from one implementation.
+
+```
+start → [ thought → tool_call → tool_result ]* → final
+                  ↘ note / budget / error
+```
+
+Three parts are not boilerplate:
+
+**History compaction.** Screen dumps are large and highly repetitive — ten in a
+row are mostly the same nav bar. Tool results older than `KEEP_FULL_RESULTS`
+(6) become one-line **step capsules** (below). Without this, a 30-step run on a
+cheap model either overruns the context window or costs several times what it
+should. The message *shape* is preserved, so the model still sees that a call
+happened and what it was.
+
+**Budgets are enforced, not suggested.** Steps, wall-clock and cumulative tokens
+each terminate the run, and the reason is reported in the `final` event rather
+than being silently swallowed. An agent driving a real phone with no ceiling is
+a bad idea.
+
+**Errors are returned, not raised.** `ToolRegistry.call` never throws. A bad
+argument comes back as `{"error": ..., "expected": <schema>}` so the model can
+correct itself on the next turn instead of the run dying.
+
+**Every run is written to disk.** `harness/recorder.py` appends each event to
+`artifacts/runs/<run_id>.jsonl` as it is yielded. The hook is in `run()` rather
+than in the CLI, so the CLI, `POST /task` and the laptop bridge behind it are
+all covered by one place, and a fourth entry point cannot forget it.
+
+Two details are the whole point of recording *here*:
+
+- **Before compaction.** The event is recorded as yielded, so the file keeps the
+  full screen dump the model was looking at when it chose. The conversation does
+  not — after six steps that result is a one-line capsule. The screen is the
+  input half of every training example; the capsule is not enough for that.
+- **It cannot break a run.** Every filesystem call is guarded, a failure latches
+  recording off for the rest of the run, and `start()` returns `None` on an
+  unwritable directory so the run proceeds unrecorded rather than failing. An
+  agent halfway through driving a real phone must not die because a disk filled.
+
+```bash
+droidpilot runs                 # what it has done, newest first
+droidpilot runs <run_id>        # replay one, step by step
+droidpilot runs <run_id> --json # raw events, for a training set
+```
+
+The recorder knows what happened but not whether it was any good. A person can
+append a label afterwards:
+
+```python
+from droidpilot.harness import recorder
+recorder.label("20260905-213700-a3f2", success=True, note="two extra dumps")
+```
+
+### Automatic verification and decision records (B8)
+
+Manual labels meant almost no run had one. Replay (B9) and any learned verifier
+later need runs labelled reliably. So a task can now declare what success looks
+like, in checks a program decides (`harness/verify.py`):
+
+| check | passes when |
+|---|---|
+| `answer` | the final answer matches a regex |
+| `reached_text` | a regex matches text on any screen read |
+| `final_text` | a regex matches text on the last screen read |
+| `package` / `reached_package` | that app was in front at the end / at any point |
+| `field` | a tool result carried that field with a non-null value |
+| `milestones` | several texts were reached, in order (MobiFlow's DAG, as a sequence) |
+
+- **Three outcomes, not two.** Each check is `pass`, `fail` or `inconclusive`. A
+  run passes only if every check passes; one fail fails it. `final_text` on a
+  run from before B8, or on a last screen read more than 120 s before the end, is
+  inconclusive, not failed.
+- **A model only when unsure, and only when asked.** With `--judge`, an
+  inconclusive run gets one helper call. The helper sees the record, not the
+  phone, and may answer `unsure`. It is never asked when the checks decided.
+- **Screen evidence is screen evidence.** Text counts as reached only if it came
+  from a screen read: element texts, `appeared` lists, the final screen. A tool's
+  own words never count. `find_element` saying "no element matching 'Screen
+  timeout'" is not evidence of reaching the Screen timeout screen.
+- **The verdict is appended as a `label` row** (`by: "verify"`), next to any
+  human label, never replacing one. `droidpilot runs` shows it.
+
+```bash
+droidpilot run "What is the screen timeout?" --expect '\b10\s*min' --reached 'screen timeout'
+droidpilot run "<goal>" --verify evals/tasks/screen_timeout.json [--judge]
+droidpilot verify latest --expect 'april\s*2022'        # check an old run
+droidpilot verify <run_id> --verify spec.json --no-label   # look, don't write
+```
+
+**Decision records.** Every step also writes one `decision` record to the run
+file:
+- the clickable and scrollable elements of the screen the model last read (the
+  candidates);
+- the call it made, with the element it aimed at resolved from its ref, index or
+  tap point;
+- what the screen did next.
+
+That is V-Droid's training format. Nothing trains on it now; it is logged because
+it cannot be recovered later. A step on an already-listed screen points back
+(`candidates_as_step`) instead of repeating the list. Decision records and a
+`final_screen` record go to the file only, never the event stream.
+
+Verified 2026-09-19:
+- **The six A/B runs recorded that day,** checked read-only: every verdict matched
+  the A/B's own grading. One DeepSeek run *had* reached a screen showing "Screen
+  timeout" before it ran out of steps. The grader could not see that; the
+  `reached_text` check did.
+- **A live DeepSeek run on the Samsung:** checked and labelled `fail` automatically
+  when it ended, with 8 decision records and a final screen 0.13 s old.
+
+Runs contain whatever the tools returned, including SMS, contacts and clipboard
+contents. `artifacts/` is gitignored. `DROIDPILOT_RECORD=0` turns it off.
+
+---
+
+## Two tool-calling conventions
+
+Cheap and local models are uneven about function calling, so the client supports
+both and can switch mid-run:
+
+- **`native`** — the OpenAI `tools` / `tool_calls` fields. Correct when
+  supported, and what OpenRouter's hosted models use.
+- **`json`** — the model writes a fenced object and the harness parses it out.
+  Necessary for small local models (LFM2 and most sub-3B GGUFs) which have no
+  tool-call training at all.
+
+```json
+{"tool": "ui_dump", "args": {"limit": 40}}
+```
+
+`auto` starts native. If the endpoint rejects the `tools` parameter, the client
+permanently falls back to json **and the system prompt is rebuilt** to teach the
+protocol — a fallback that silently left the model uninstructed would look like
+the model simply refusing to act.
+
+In json mode the loop enforces one call per turn, because small models reliably
+lose track when asked to batch.
+
+**A call that cannot be read is corrected, not taken as the answer (B11).**
+Before, a json-mode reply the parser could not read - single quotes, a trailing
+comma, an unbalanced brace, `function`/`parameters` instead of `tool`/`args`, a
+bare `<tool_call>` tag - fell through as prose and ended the run as if it were
+the answer. Now `diagnose_attempt` recognises the attempt and names what is
+wrong ("it uses single quotes; JSON needs double quotes"). The loop sends a
+short correction with one correct example and **does not echo the broken
+reply**: shown its own mistake, a small model tends to copy it. After three in a
+row the run stops with `stopped_by="malformed_calls"`, and a good call resets
+the count. Native tool calls whose arguments are not JSON get the same kind of
+error back instead of reaching the tool as a string.
+
+The test is deliberately narrow. It needs a json fence, a tool-call tag, or an
+object naming a tool alongside its arguments, so an answer that merely contains
+JSON is still an answer. Run against every final answer recorded so far (728 in
+909 runs), it flagged none.
+
+---
+
+## Delegate vs proxy
+
+The server exposes both, and the difference is the point of the project.
+
+```
+PROXY  (POST /tool)                 DELEGATE  (POST /task)
+laptop model reasons                laptop sends one goal
+  → tool call over network            → phone model reasons
+  → phone acts                        → tool call over loopback
+  → result over network               → phone acts
+  → laptop model reasons              → repeat, locally
+  → ... N expensive turns             → one result back
+```
+
+For a 30-step task, proxy mode spends 30 turns of a large model with a growing
+context, plus 30 network round trips. Delegate mode spends **one** laptop turn
+and 30 turns of a cheap model against localhost.
+
+Proxy mode is kept deliberately: it is better for debugging, for one-off pokes,
+and for tasks where you genuinely want the stronger model making every call.
+`bridge/mcp_bridge.py` exposes both to a laptop Claude Code session as
+`phone_task` and `phone_tool`.
+
+Streaming is NDJSON — one event object per line, flushed as it happens — so a
+watching client sees each tap land rather than a report at the end.
+
+---
+
+### MCP hygiene (B12)
+
+- **Annotations on every tool** (`mcp_hints.py`). MCP clients auto-approve on
+  `readOnlyHint`, so a wrong hint in the permissive direction is a safety bug.
+  - Read-only is an explicit list of 29 tools that observe without changing the
+    phone or returning private content. SMS, contacts, the clipboard,
+    notifications and file contents are excluded.
+  - Destructive covers the dangerous packs, the OUTBOUND tools, and file and
+    clipboard writes outside those packs, 24 in all.
+  - Everything else, such as `tap`, gets no destructive hint. Per the MCP spec
+    that means "may be destructive", which is true of a tap.
+- **`batch`** on the direct MCP server runs up to 20 calls in one round trip,
+  with `stop_on_error` and `list_at_end`. It refuses a destructive call, and a
+  nested batch, before running anything: one approval must not stand in for a
+  send.
+- **Errors carry `next`.**
+  - An unknown tool comes back with close matches and a pointer to
+    `find_tool`.
+  - Bad arguments come back with the expected schema.
+  - An exception is mapped to its likely cause: adb, bridge, a timeout, or
+    anything else ("read the screen before trying again").
+- **`diagnose(attempt_fix)`** returns data: adb, screen and bridge. Its only
+  fixes are safe ones:
+  - It restarts the adb server only on a laptop, never on the phone itself,
+    where it would cut the agent's own loopback connection.
+  - It re-enables the bridge service.
+  - It never runs `pkill -f uiautomator`, never unlocks the phone, and never
+    clears an unauthorised prompt.
+- **Task control for the laptop:**
+  - `POST /task {"background": true}` returns at once.
+  - `GET /task/<id>` and `GET /tasks` report progress. They show the last
+    steps without screen dumps, plus any question waiting on an answer.
+  - `POST /task/<id>/stop` ends the run at the next step boundary, as
+    `stopped_by="operator_stop (...)"`.
+  - `GET /runs/<id|latest>` reads a recorded run back with its verdict.
+  - `mcp_bridge.py` exposes these as `phone_task(background=True)`,
+    `phone_task_status`, `phone_task_stop`, `phone_reply` and
+    `phone_run_inspect`.
+
+Verified 2026-09-19:
+- A real MCP client session over stdio against `droidpilot mcp` on the Samsung
+  listed every tool with annotations and ran a batch of three observation tools.
+  A batch containing an outbound send was refused before anything ran.
+- `diagnose` was clean on both phones.
+- The background, status, stop and runs path is tested end to end against the
+  real HTTP handler.
+
+## Permissions
+
+The project brief was "full phone control, no exceptions" on a dedicated
+experimental handset, and the tool surface reflects that. The gate is therefore
+about *avoiding accidents*, not about containing an attacker.
+
+Every tool carries a `dangerous` flag. `Policy` sits in front of every call:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | dangerous tools run (default) |
+| `ask` | dangerous tools prompt on the terminal |
+| `readonly` | dangerous tools are blocked |
+
+Two tools are additionally in a **default deny list** regardless of mode,
+because they reach other people and cost money:
+
+```
+phone_sms_send      phone_call
+```
+
+They run only when named explicitly: `--allow phone_sms_send`. `device_shell`
+also refuses a small list of unrecoverable command patterns (`rm -rf /`, `mkfs`,
+`fastboot`, …) unless `confirm_destructive=true` — a speed bump for a confused
+agent, not a security boundary, since the shell is fully general.
+
+### Writes are judged by target, not by tool
+
+A tool-level risk class is too coarse: `tap` is harmless on "Close" and is a
+purchase on "Pay now". So every tap is classified by the element it will
+actually hit - after the pre-tap check has re-found it - against
+`policy/writes.json`:
+
+| verdict | examples | what happens |
+|---|---|---|
+| read | Close, Next, a list row | tap |
+| forbidden | Send, Post, Pay now, Place order, Report, Log out | refused, unless the operator allows that rule id for the run (`--allow-rule any.send`) |
+| write | app-specific actions you declare | only if the run enabled it (`--allow-write <action>`) and the mode is not `readonly` |
+
+The verdict is the stricter of the intended target and whatever sits under
+the tap point: a list row whose centre lands on its own "Send" button is a
+send, whatever the row's label says. Typing into a comment, message or reply
+box is a send too, and text entry there is refused (`reads.composer_on_screen`).
+
+Every "no" fails closed. `policy/reads.py` holds the matching hook points for
+reads (`acquire` / `commit` around anything that opens content); the default
+build allows and counts nothing, and a deployment that needs per-action
+ceilings plugs its limiter in there without touching the call sites.
+
+### App cards and verified deep links (B6)
+
+An agent on the phone starts with no history, so without help it would
+rediscover each trap - Instagram 446's search going silent after one query, the
+reel overlay lagging the swipe, a sheet left open stranding the next step - at
+the cost of steps and tokens.
+
+**Cards** (`src/droidpilot/cards/<package>.md`) hold that knowledge per app; this
+repo ships one for Instagram. The first time an app with a card comes to the
+front, the card goes into the conversation - once per run, so a run that never
+opens Instagram never pays for the Instagram card.
+
+**`open_link(url)`** replaces a navigation sequence with one intent - on
+Instagram, search + typing + tapping a result becomes a single profile open. It
+fails in ways that look like success, so it is strict:
+
+- only prefixes in `cards/deeplinks.json` are followed, and only once
+  `droidpilot deeplinks --verify` has watched them land on a real phone;
+- the foreground must become the package the registry names - landing anywhere
+  else is an error, not a success;
+- a locked or sleeping phone is refused up front, because on a lock screen every
+  deep link "succeeds" and every read comes back empty;
+- the URL comes from the model and goes into a shell command, so anything
+  outside a URL-safe character set is refused rather than escaped;
+- the read it stands for still goes through the read hooks in
+  `policy/reads.py`.
+
+Verified 2026-09-18: `instagram://user?username=` (IG 447) and
+`twitter://user?screen_name=` (X 12.25) on the Samsung; `https://t.me/` and
+`tg://resolve?domain=` (Telegram 12.10) on the realme, which is where Telegram is
+installed - on the Samsung both correctly reported "did not land". The first
+verification attempt found the Samsung's screen had locked; all four were refused
+before anything opened.
+
+**Notes now go in after a turn's tool results.** Stagnation warnings and cards
+are held until every tool call in the model's turn has its result. A user message
+between two tool results breaks the tool-calling format, and the B4 code also
+broke out of the batch on a warning, leaving the model's remaining calls with no
+result at all - reproduced on the old code: three calls, two results.
+
+### Text entry that proves it worked (B10)
+
+`text_input` was `adb shell input text`, sent and forgotten. Measured on both
+phones on 2026-09-19, that command does not drop non-ASCII quietly: with
+Devanagari it throws a `NullPointerException` inside Android's
+`InputShellCommand` and types nothing. That rules out Hinglish queries, ₹ and
+emoji. An app helper that avoided the crash by stripping non-ASCII first could
+send a message with pieces missing.
+
+`runtime/text_entry.py` now puts text in a field in three stages, and every result
+names the channel used:
+
+1. **The bridge's `/text`** (ACTION_SET_TEXT on the input-focused field), which
+   takes any Unicode. Bridge 0.2.2 re-reads the live node for up to 0.8 s and
+   returns what the field holds.
+2. **An independent read-back** from a fresh tree read: the focused editable
+   field must hold the text too. `performAction` can return true and change
+   nothing, as with a residual focus node, so neither the return value nor one
+   reading is trusted alone. A field showing only its hint reads as empty (the
+   `H` flag).
+3. **`adb input text` as a fallback, for plain ASCII only.** It runs when the
+   bridge is unreachable or the app ignored ACTION_SET_TEXT, and it clears the
+   field first when replacing. Non-ASCII with no working bridge is refused
+   before anything is typed.
+
+A mismatch is an error that says what the field holds. A password field reads
+back masked, so it is reported `verified: null`, never `true`. `text_input`
+uses this path, and anything that sends stops before Send when the text did not
+take.
+
+**Verified 2026-09-19** on both phones, in the Settings search field:
+
+| input | result | time |
+|---|---|---|
+| ASCII | verified by node and tree | 0.35-0.7 s |
+| `दिल्ली food ₹99 😋` | verified by node and tree | 0.35-0.7 s |
+| append | verified | — |
+| clear | verified | — |
+| bridge off, ASCII | typed by `adb` and verified | — |
+| bridge off, Devanagari | refused up front | — |
+| old path, Devanagari | `NullPointerException`; the field stayed empty | — |
+
+**Not done: the IME.** A zero-UI keyboard in the bridge APK, the second half of
+the plan, would cover apps that ignore ACTION_SET_TEXT. Using it means switching
+the phone's system keyboard, which is a person's decision. No app met so far has
+needed it.
+
+### Guarded replay of verified runs (B9)
+
+A routine that has been done correctly once can be done again without a model.
+`harness/replay.py` turns a **verified** run (B8's `pass`, or a person's
+`success=True`) into a macro, and refuses an unverified one, whose mistakes
+it would replay faithfully.
+
+**What a macro holds.** From the run's decision records, each action step
+keeps:
+- the **pre-state**: the actionable element keys and the app, taken from the
+  screen the model last read;
+- the target as a **selector** (id, text, description), never a ref.
+
+Pure reads are dropped. `--slot handle=creator_a` turns a value into a
+parameter.
+
+**How a replay runs.** Each step waits for the live screen to match its
+pre-state. The rule is mobilerun's: element-key Jaccard × 0.85 + same app ×
+0.15, at least 0.85. The step then finds its target among the visible elements
+and acts through the same registry the agent uses, so B2 write rules and the
+read hooks apply unchanged. Replay configures the write policy itself: no write
+action unless named with `--allow-write`, tagged with the replay's run id. On the first mismatch it stops and returns a handoff;
+`--handoff` gives the rest of the goal to the agent. Each replay is recorded as
+a run (`model: "replay"`), including the screen each step was matched against.
+It is then verified with the macro's own screen checks. A replay has no answer,
+so `answer` checks are skipped.
+
+Two things the live runs taught:
+- **A pre-state is only as fresh as the last read.** `wait_stable` right after
+  a tap carried the previous screen and failed to match at 0.30. A step whose
+  saved screen predates the last action now has no screen guard; a targeted
+  step is still guarded by having to find its element.
+- **`scroll_to` said "found" for an element nobody could tap.** On Samsung
+  Settings > Display, "Screen timeout" sat under the collapsing title bar,
+  hidden, while its summary line was visible. `scroll_to` now needs a visible
+  match. It nudges a hidden one into view with short, slow drags, except on a
+  reel viewer, where a drag could advance to the next reel.
+
+Verified 2026-09-19 on the Samsung (Settings > Display > Screen timeout):
+- The scripted run took 12.5 s and was verified `pass`.
+- The macro, 7 steps, was replayed with no model through `droidpilot macro run`:
+  7 of 7 steps, every guarded match 1.00, 11.4 s, verified `pass` automatically.
+  The timeout setting was 600000 before and after.
+- On the realme the same macro stopped at step 3: the realme's Settings matched
+  at 0.23. It handed off instead of guessing.
+
+The human-demo half (Part C) needs the demo recorder, which does not exist yet.
+The macro format is the target it will write to.
+
+### Step capsules, `remember` and `recall` (B7)
+
+Until B7, a result older than six steps was cut to its first 220 characters. On
+a profile pass the follower count read at step 3 was gone by step 10: the model
+either re-read the screen or guessed. And the
+cut was blind: 220 characters of a screen dump are mostly JSON keys.
+
+Now an aged-out result becomes one line, built by `harness/history.py` from
+what the loop already knows - the call, the screen fingerprint and labels
+before and after - with no model call:
+
+    T+00:03 #4 ui_dump(limit=40) -> content changed (com.android.settings);
+    appeared: 'Digital Wellbeing & parental controls', ... +3 more
+    | full result: recall(steps=[4])
+
+- **Neutral wording.** A capsule says what was observed - `content changed`,
+  `same items, positions moved`, `screen unchanged`, `no screen read`,
+  `returned an error: ...` - never "successfully", "failed" or "navigated to". A
+  verdict in history gets believed later, even when it was wrong.
+- **`remember(key, value)`** pins a fact for the whole run. Notes ride in the
+  system message on every call and are never compacted. A note that reads like
+  a verdict is kept, with a hint to record what was seen instead.
+- **`recall(steps=[n])`** returns step n's full result from the run's own JSONL;
+  **`recall(query=...)`** searches every earlier result and thought. Recall
+  never finds its own earlier results. With recording off, it reads an
+  in-memory copy.
+- **JSON-mode runs are compacted now.** Results were found by `role == "tool"`,
+  but in json mode a result is a user message, so a json-mode run was never
+  compacted at all. Results are now marked by step, whatever the convention.
+- `remember` and `recall` neither advance nor reset the stagnation idle count:
+  pinning three notes is not "the screen has not changed in three steps".
+
+Verified 2026-09-19 on both phones (Settings, scripted model: no model quota). Six old results became capsules naming what each scroll brought
+into view. The pinned note stayed in the system message. `recall(steps=[1])`
+returned step 1's 3.7-4 KB result. `recall(query=...)` found the label at steps
+1 and 10, where the list had been scrolled back.
+
+### Handing back to a person, and the screens that are not ours to clear (B3)
+
+Two directions, and they are not the same:
+
+- **`request_human(reason)`** - the agent gives up; the run ends with
+  `stopped_by="human_required"` and the reason. Nothing waits.
+- **`ask_operator(question)`** - the agent needs one fact and can continue with
+  it. The run BLOCKS. On the CLI the question goes to the terminal; over HTTP the
+  task emits an `ask` event carrying a `session_id` and waits for
+  `POST /reply {"session_id", "answer"}`. No channel, or no answer in time, ends
+  the run rather than letting the model guess.
+
+The third path is not the model's to decide. The rule is that a phone meeting a
+checkpoint or 2FA **stops entirely**, and a cheap model looking at
+"We detected unusual activity" will keep tapping, because tapping is what it
+does. So `harness/handoff.py` checks every screen the loop sees, and a match ends
+the run whatever the model intended - before the next tool call, not after it.
+The prompt says the same in words; the guard is what actually holds.
+
+What it matches: suspicious/unusual activity, "confirm it's you", security
+checks and CAPTCHAs, "action blocked", "try again later", two-factor and code
+prompts, disabled or restricted accounts - plus **a password field**, which has
+no business appearing in a session on an account that is already signed in.
+Ordinary words like "Log in" are deliberately not matched; they appear on
+screens that are perfectly safe.
+
+Verified live: pointed at a page containing the phrase, the run stopped at step 1
+with `human_required` and the evidence attached. That run also shows the honest
+limitation - **it matches text, so a screen that merely mentions a challenge
+trips it too** (there, a search box containing the phrase). Stopping a run that
+did not need stopping is the cheap direction of that error, and
+`checkpoint_guard=False` exists for the rare case where it is wrong.
+
+### A stuck run says so, instead of burning the budget (B4)
+
+Cheap models loop, and these apps give them reasons to: Instagram 446's search
+goes quiet after the first query in a session, swipes do not always advance, and
+a tap on a control that has scrolled away does nothing at all. Left alone the
+model repeats the call until `max_steps` ends the run — the most expensive way to
+fail, reported under the wrong reason.
+
+`harness/stagnation.py` watches for one narrow thing: **the same tool, the same
+arguments, and no evidence the screen moved.**
+
+| attempts | what happens |
+|---|---|
+| 2 | a `POSSIBLY STUCK` note goes into the conversation, telling the model to read the screen and change approach rather than retry |
+| 3 | the run ends with `stopped_by="stagnation"`, naming the tool and arguments |
+
+Repeating a call that *does* move the screen is progress through a feed and is
+never flagged. A screen matching one seen `revisit_gap` steps earlier produces a
+softer hint ("you were on this screen at step N") because circling back is
+sometimes the right route. The fingerprint comes from `state.remember`, which
+every read already computes, so this costs nothing.
+
+**No fingerprint at all counts as no progress, not as progress.** That was found
+live: 25 identical swipes with no `ui_dump` between them ran to `max_steps`
+without a word, because "unknown" was being treated as "the screen moved". With
+that fixed, the same run stops in 3 steps, or 5 with reads interleaved.
+
+`--no-stagnation-stop` keeps the warning and drops the stop, which is what an
+operator watching a run by hand usually wants. The prompt carries the matching
+operating rules — wait at most three times, check the last action took effect,
+lengthen a swipe that did nothing then reverse it, one query per tab, three
+routes then report — so the model has the same policy the harness enforces.
+
+The HTTP server binds `127.0.0.1` by default. Exposing it on the LAN requires
+an explicit `--host` and then **mandates** a bearer token, generated on first
+run into `~/.droidpilot/token` (0600). This endpoint can do anything to the
+phone; treat the token accordingly.
+
+---
+
+## Selectors and drift
+
+App UIs change without warning. Selectors live as **data** in
+`selectors/<app>.json`, pinned to the app version they were verified against.
+
+```
+check_drift()      → exactly which resource-ids vanished or appeared
+record_baseline()  → pin the new version once you have re-verified
+```
+
+Three rules the registry enforces, each learned the hard way:
+
+1. **Drift must be computed from the raw hierarchy**, not the filtered element
+   list. Pure-layout containers are dropped from the element list as noise yet
+   remain valid anchors, so checking the filtered set reports working selectors
+   as missing — a false alarm that sends you chasing a non-existent app update.
+2. **Intermittent anchors are marked `optional`** so they never read as drift.
+   Instagram's `scrubber` appears in ~29% of dumps; treating it as required
+   makes most dumps look broken and trains you to ignore the warning that
+   matters.
+3. **Fail loud.** A missing anchor returns `null` and appears in `_unavailable`.
+   It never falls back to a guess — a plausible wrong value is worse than a gap.
+
+The `learn` pack is the other half: `explore_screen` → `diff_after_action` →
+`propose_selectors` → `learn_screen` lets the agent map an app nobody has
+written selectors for. `diff_after_action` is the clever one — scroll, and
+whatever changed is content while whatever stayed is chrome.
+
+---
+
+## What this is not
+
+Stated plainly, because the boundary is a design decision rather than an
+oversight:
+
+- **Not an anti-detection tool.** No device-identity spoofing, no CAPTCHA
+  solving, no root exploits, no consent-dialog bypass. Android's security model
+  is treated as a boundary. MediaProjection consent in particular is one tap per
+  capture session and cannot legitimately be avoided — not even by a
+  device-owner app.
+- **Not a way around platform terms.** Automating an app does not change what
+  its terms allow; wrapping it in an agent changes the convenience, not the
+  permission.
+- **Not multi-tenant.** One phone, one operator, full trust. The token protects
+  against a stranger on your network, not against the operator.
+- **Not a replacement for an AccessibilityService.** uiautomator2 *is* a
+  `UiAutomation`, which is itself a special AccessibilityService, and Android
+  permitted exactly one.
+  **Corrected 2026-09-04: tested on Android 14, and false.** With the bridge
+  enabled and serving, u2 still dumped normally at 215 ms. The bridge shipped
+  as an **addition**, and reads the screen in ~13 ms - see
+  [ACCESSIBILITY.md](ACCESSIBILITY.md).
